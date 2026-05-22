@@ -3,7 +3,7 @@ use itertools::Itertools;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
-    docker::{get_images_from_docker_daemon, get_in_use_images},
+    docker::{get_compose_containers, get_images_from_docker_daemon, get_in_use_images},
     http::Client,
     registry::{check_auth, get_token},
     structs::{image::Image, update::Update},
@@ -248,6 +248,16 @@ pub async fn get_updates(
     let mut images = join_all(handles).await;
     images.extend(errored_images);
     let mut updates: Vec<Update> = images.iter().map(|image| image.to_update()).collect();
+
+    // Attach compose-project info (folder, service, project) to each local update, so the
+    // API/UI can map an available update back to the folder that can apply it.
+    let compose_map = get_compose_containers(ctx).await;
+    for update in &mut updates {
+        if let Some(containers) = compose_map.get(&update.reference) {
+            update.compose = containers.clone();
+        }
+    }
+
     updates.extend_from_slice(&remote_updates);
     updates
 }

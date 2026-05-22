@@ -1,3 +1,4 @@
+pub mod container;
 pub mod image;
 pub mod inspectdata;
 pub mod parts;

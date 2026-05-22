@@ -1,6 +1,6 @@
 use serde::{ser::SerializeStruct, Deserialize, Serialize};
 
-use super::{parts::Parts, status::Status};
+use super::{container::ComposeContainer, parts::Parts, status::Status};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[cfg_attr(test, derive(PartialEq, Default))]
@@ -12,6 +12,10 @@ pub struct Update {
     pub time: u32,
     pub server: Option<String>,
     pub in_use: bool,
+    /// Compose-managed containers using this image (empty if none / not compose-managed).
+    /// `#[serde(default)]` so updates fetched from older remote Cup instances still deserialize.
+    #[serde(default)]
+    pub compose: Vec<ComposeContainer>,
     #[serde(skip_serializing, skip_deserializing)]
     pub status: Status,
 }

@@ -34,7 +34,11 @@ COPY --from=web /web/dist src/static
 RUN cargo build --release
 
 ### Main ###
-FROM scratch
+# Not `scratch` anymore: applying updates (running `docker compose`) needs the
+# docker CLI + compose plugin available in the image.
+FROM alpine:3.20
+
+RUN apk add --no-cache docker-cli docker-cli-compose
 
 # Copy binary
 COPY --from=build /cup/target/release/cup /cup

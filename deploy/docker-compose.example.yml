@@ -1,0 +1,57 @@
+# Example production deployment for the "apply updates" Cup fork.
+# Adapt paths/hostnames to your environment, then `docker compose up -d`.
+services:
+  cup:
+    # The apply-updates feature is NOT in upstream Cup, so you must run YOUR image.
+    # Build it on this host:   docker build -t cup-apply-updates:latest .
+    # (or push to your own registry and reference it here).
+    image: cup-apply-updates:latest
+    container_name: cup
+    restart: unless-stopped
+    command: -c /config/cup.json serve
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /home/caradoc/docker/cup/cup.json:/config/cup.json
+      # REQUIRED for applying updates: mount the directory that holds your compose
+      # projects at the SAME absolute path it has on the host. Cup reads each
+      # container's working_dir from its labels (an absolute host path) and runs
+      # `docker compose` there, so that path must exist *inside* the container too.
+      # Change this to wherever your stacks actually live.
+      - /home/caradoc/docker-compose:/home/caradoc/docker-compose
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      # Keep Watchtower from replacing your custom image with upstream's :latest.
+      - "com.centurylinklabs.watchtower.enable=false"
+
+      # --- HTTP -> HTTPS redirect ---
+      - "traefik.http.routers.cup.entrypoints=http"
+      - "traefik.http.routers.cup.rule=Host(`cup.boydenclan.com`)"
+      - "traefik.http.middlewares.cup-https-redirect.redirectscheme.scheme=https"
+      - "traefik.http.routers.cup.middlewares=cup-https-redirect"
+
+      # --- HTTPS: web UI + the /actions/update endpoint (BOTH behind Authentik) ---
+      # This router matches the whole host, so it covers "/" and "/actions/update".
+      # The more specific /api/ router below wins for /api/ paths only.
+      - "traefik.http.routers.cup-secure.entrypoints=https"
+      - "traefik.http.routers.cup-secure.rule=Host(`cup.boydenclan.com`)"
+      - "traefik.http.routers.cup-secure.tls=true"
+      - "traefik.http.routers.cup-secure.service=cup"
+      - "traefik.http.routers.cup-secure.middlewares=authentik@file"
+
+      # --- HTTPS: read-only JSON API (no auth, e.g. for a dashboard) ---
+      # SECURITY: keep this scoped to /api/ ONLY. Never add /actions/ here, or the
+      # update endpoint becomes unauthenticated = anyone can recreate your containers.
+      - "traefik.http.routers.cup-api.entrypoints=https"
+      - "traefik.http.routers.cup-api.rule=Host(`cup.boydenclan.com`) && PathPrefix(`/api/`)"
+      - "traefik.http.routers.cup-api.tls=true"
+      - "traefik.http.routers.cup-api.service=cup"
+
+      # --- Service ---
+      - "traefik.http.services.cup.loadbalancer.server.port=8000"
+      - "traefik.docker.network=proxy"
+
+networks:
+  proxy:
+    external: true

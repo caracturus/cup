@@ -9,6 +9,7 @@ import { theme } from "./theme";
 import RefreshButton from "./components/RefreshButton";
 import Search from "./components/Search";
 import { Server } from "./components/Server";
+import ActionBar from "./components/ActionBar";
 import { useData } from "./hooks/use-data";
 import DataLoadingError from "./components/DataLoadingError";
 import Filters from "./components/Filters";
@@ -37,6 +38,7 @@ function App() {
     statuses: [],
   });
   const [searchQuery, setSearchQuery] = useState("");
+  const [selected, setSelected] = useState<Set<string>>(new Set());
 
   if (isLoading) return <Loading />;
   if (isError || !data) return <DataLoadingError />;
@@ -45,6 +47,18 @@ function App() {
       setFilters({ onlyInUse: false, registries: [], statuses: [] });
     }
     setShowFilters(!showFilters);
+  };
+  const toggleSelected = (reference: string) =>
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(reference)) next.delete(reference);
+      else next.add(reference);
+      return next;
+    });
+  const clearSelected = () => setSelected(new Set());
+  const handleUpdate = () => {
+    // Phase 4 wires this to the backend. For now, just record the intent.
+    console.log("Update requested for:", [...selected]);
   };
 
   return (
@@ -137,7 +151,12 @@ function App() {
                       )
                       .filter((image) => image.reference.includes(searchQuery))
                       .map((image) => (
-                        <Image data={image} key={image.reference} />
+                        <Image
+                          data={image}
+                          checked={selected.has(image.reference)}
+                          onToggle={toggleSelected}
+                          key={image.reference}
+                        />
                       ))}
                   </Server>
                 ))}
@@ -145,6 +164,11 @@ function App() {
           </div>
         </div>
       </div>
+      <ActionBar
+        count={selected.size}
+        onClear={clearSelected}
+        onUpdate={handleUpdate}
+      />
     </div>
   );
 }

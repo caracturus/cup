@@ -19,6 +19,7 @@ import {
   X,
 } from "lucide-react";
 import Badge from "./Badge";
+import { Checkbox } from "./ui/Checkbox";
 import { getDescription } from "../utils";
 
 const clickable_registries = [
@@ -28,7 +29,15 @@ const clickable_registries = [
   "gcr.io",
 ]; // Not all registries redirect to an info page when visiting the image reference in a browser (e.g. Gitea and derivatives), so we only enable clicking those who do.
 
-export default function Image({ data }: { data: Image }) {
+export default function Image({
+  data,
+  checked,
+  onToggle,
+}: {
+  data: Image;
+  checked: boolean;
+  onToggle: (reference: string) => void;
+}) {
   const [open, setOpen] = useState(false);
   const handleOpen = () => {
     setOpen(true);
@@ -54,11 +63,29 @@ export default function Image({ data }: { data: Image }) {
         break;
     }
   }
+  // A row is selectable only if it has an update AND belongs to a compose project
+  // (otherwise there's no folder to run `docker compose` in).
+  const selectable =
+    data.result.has_update === true && (data.compose?.length ?? 0) > 0;
   return (
     <>
-      <button onClick={handleOpen} className="w-full">
-        <li
-          className={`flex items-center gap-4 break-all px-6 py-4 text-start hover:bg-${theme}-100 hover:dark:bg-${theme}-900/50 transition-colors duration-200`}
+      <li
+        className={`flex items-center gap-4 break-all px-6 py-4 hover:bg-${theme}-100 hover:dark:bg-${theme}-900/50 transition-colors duration-200`}
+      >
+        {selectable ? (
+          <Checkbox
+            checked={checked}
+            onCheckedChange={() => onToggle(data.reference)}
+            aria-label={`Select ${data.reference} to update`}
+            className="shrink-0"
+          />
+        ) : (
+          // Keep icons/names aligned on rows without a checkbox
+          <span className="w-4 shrink-0" aria-hidden="true" />
+        )}
+        <button
+          onClick={handleOpen}
+          className="flex min-w-0 flex-1 items-center gap-4 text-start"
         >
           <Box className={`size-6 shrink-0 text-${theme}-500`} />
           <span className="font-mono">{data.reference}</span>
@@ -76,8 +103,8 @@ export default function Image({ data }: { data: Image }) {
               <info.icon />
             </WithTooltip>
           </div>
-        </li>
-      </button>
+        </button>
+      </li>
       <Dialog open={open} onClose={setOpen} className="relative z-10">
         <DialogBackdrop
           transition

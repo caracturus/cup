@@ -16,7 +16,9 @@ services:
       # projects at the SAME absolute path it has on the host. Cup reads each
       # container's working_dir from its labels (an absolute host path) and runs
       # `docker compose` there, so that path must exist *inside* the container too.
-      # Change this to wherever your stacks actually live.
+      # This is where your compose files + .env files live. You do NOT need to mount
+      # your volume-data dir (e.g. ~/docker): bind mounts are resolved on the host by
+      # the Docker daemon, not inside this container.
       - /home/caradoc/docker-compose:/home/caradoc/docker-compose
     networks:
       - proxy

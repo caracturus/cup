@@ -37,9 +37,12 @@ Use [`docker-compose.example.yml`](./docker-compose.example.yml) as a starting p
 Two changes versus a stock Cup deployment:
 
 1. **Mount your compose-projects directory at the same absolute path** it has on the
-   host (e.g. `-v /home/caradoc/docker-compose:/home/caradoc/docker-compose`). The
-   folder paths Cup gets from container labels are absolute host paths, so they must
-   resolve to the same location inside the container.
+   host: `-v /home/caradoc/docker-compose:/home/caradoc/docker-compose`. This is where
+   your compose files and `.env` files live; the absolute folder paths Cup reads from
+   container labels must resolve to the same location inside the container. You do
+   **not** need to mount your volume-data directory (e.g. `~/docker`) — bind mounts are
+   resolved on the host by the Docker daemon, not inside Cup's container, so keeping it
+   out reduces what Cup can touch.
 2. **Exclude it from Watchtower** (`com.centurylinklabs.watchtower.enable=false`) so
    your custom image isn't replaced by upstream's `:latest`.
 

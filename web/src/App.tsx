@@ -10,6 +10,7 @@ import RefreshButton from "./components/RefreshButton";
 import Search from "./components/Search";
 import { Server } from "./components/Server";
 import ActionBar from "./components/ActionBar";
+import UpdateDialog from "./components/UpdateDialog";
 import { useData } from "./hooks/use-data";
 import DataLoadingError from "./components/DataLoadingError";
 import Filters from "./components/Filters";
@@ -39,6 +40,7 @@ function App() {
   });
   const [searchQuery, setSearchQuery] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [showUpdate, setShowUpdate] = useState(false);
 
   if (isLoading) return <Loading />;
   if (isError || !data) return <DataLoadingError />;
@@ -57,8 +59,7 @@ function App() {
     });
   const clearSelected = () => setSelected(new Set());
   const handleUpdate = () => {
-    // Phase 4 wires this to the backend. For now, just record the intent.
-    console.log("Update requested for:", [...selected]);
+    if (selected.size > 0) setShowUpdate(true);
   };
 
   return (
@@ -66,7 +67,9 @@ function App() {
       className={`flex min-h-screen justify-center bg-white dark:bg-${theme}-950`}
     >
       <div className="mx-auto h-full w-full max-w-[80rem] px-4 sm:px-6 lg:px-8">
-        <div className="mx-auto my-8 flex h-full max-w-[48rem] flex-col">
+        <div
+          className={`mx-auto my-8 flex h-full max-w-[48rem] flex-col ${selected.size > 0 ? "pb-28" : ""}`}
+        >
           <div className="flex items-center gap-1">
             <h1 className="text-5xl font-bold tracking-tight lg:text-6xl dark:text-white">
               Cup
@@ -169,6 +172,15 @@ function App() {
         onClear={clearSelected}
         onUpdate={handleUpdate}
       />
+      {showUpdate && (
+        <UpdateDialog
+          references={[...selected]}
+          onClose={(didUpdate) => {
+            setShowUpdate(false);
+            if (didUpdate) window.location.reload();
+          }}
+        />
+      )}
     </div>
   );
 }

@@ -22,6 +22,8 @@ RUN --mount=type=cache,target=/cup/target \
 
 ### Main (alpine so we have a shell for debugging during dev) ###
 FROM alpine:3.20
+# docker CLI + compose plugin so Cup can run `docker compose` (Option B)
+RUN apk add --no-cache docker-cli docker-cli-compose
 COPY --from=build /cup/cup-bin /cup
 EXPOSE 8000
 ENTRYPOINT ["/cup"]

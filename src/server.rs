@@ -13,16 +13,19 @@ use xitca_web::{
     error::Error,
     handler::{handler_service, path::PathRef, state::StateRef},
     http::{StatusCode, WebResponse},
-    route::get,
+    route::{get, post},
     service::Service,
     App, WebContext,
 };
+
+use serde::{Deserialize, Serialize};
+use tokio::process::Command;
 
 use crate::{
     check::get_updates,
     config::Theme,
     error,
-    structs::update::Update,
+    structs::update::{Update, UpdateInfo},
     utils::{
         json::{to_full_json, to_simple_json},
         sort_update_vec::sort_update_vec,
@@ -90,7 +93,8 @@ pub async fn serve(port: &u16, ctx: &Context) -> std::io::Result<()> {
         .at("/api/v2/json", get(handler_service(api_simple)))
         .at("/api/v3/json", get(handler_service(api_full)))
         .at("/api/v2/refresh", get(handler_service(refresh)))
-        .at("/api/v3/refresh", get(handler_service(refresh)));
+        .at("/api/v3/refresh", get(handler_service(refresh)))
+        .at("/actions/update", post(handler_service(apply_updates)));
     if !ctx.config.agent {
         app_builder = app_builder
             .at("/", get(handler_service(_static)))
@@ -175,6 +179,172 @@ async fn api_full(data: StateRef<'_, Arc<Mutex<ServerData>>>) -> WebResponse {
 async fn refresh(data: StateRef<'_, Arc<Mutex<ServerData>>>) -> WebResponse {
     data.lock().await.refresh().await;
     WebResponse::new(ResponseBody::from("OK"))
+}
+
+#[derive(Deserialize)]
+struct UpdateRequest {
+    /// Image references the user selected in the UI.
+    references: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct UpdateResultItem {
+    reference: String,
+    project: String,
+    working_dir: String,
+    success: bool,
+    message: String,
+}
+
+/// A validated compose target to update, resolved server-side from scan data.
+struct UpdateTarget {
+    reference: String,
+    project: String,
+    working_dir: String,
+    config_files: String,
+    is_self: bool,
+}
+
+/// POST /actions/update — applies floating-tag (digest) updates by running
+/// `docker compose pull && docker compose up -d` in each selected project's folder.
+///
+/// Security: the client sends only image references. The server resolves the actual
+/// folders from scan data it collected itself (never from client input), validates that
+/// each reference currently has a digest update and is compose-managed, and runs commands
+/// via an argument array (no shell). In production this route MUST sit behind authentication
+/// (it is intentionally not under /api/, which is commonly left unauthenticated).
+async fn apply_updates(data: StateRef<'_, Arc<Mutex<ServerData>>>, body: String) -> WebResponse {
+    let req: UpdateRequest = match serde_json::from_str(&body) {
+        Ok(req) => req,
+        Err(e) => {
+            return WebResponse::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(ResponseBody::from(format!("Invalid request body: {}", e)))
+                .unwrap();
+        }
+    };
+
+    // Best-effort own-container id (Docker sets HOSTNAME to the container id) so we can
+    // refuse to update Cup itself, which would kill the process mid-request.
+    let own_id = std::env::var("HOSTNAME").unwrap_or_default();
+
+    // Resolve + validate targets under a short lock, then release it before running commands.
+    let targets: Vec<UpdateTarget> = {
+        let guard = data.lock().await;
+        let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+        let mut targets = Vec::new();
+        for reference in &req.references {
+            let Some(update) = guard.raw_updates.iter().find(|u| &u.reference == reference) else {
+                continue;
+            };
+            // Only digest (floating-tag) updates can be applied with pull && up -d.
+            let is_digest = matches!(update.result.info, UpdateInfo::Digest(_));
+            if update.result.has_update != Some(true) || !is_digest {
+                continue;
+            }
+            for container in &update.compose {
+                if container.working_dir.is_empty() {
+                    continue;
+                }
+                if !seen.insert((container.project.clone(), container.working_dir.clone())) {
+                    continue;
+                }
+                let is_self = !own_id.is_empty() && container.id.starts_with(&own_id);
+                targets.push(UpdateTarget {
+                    reference: reference.clone(),
+                    project: container.project.clone(),
+                    working_dir: container.working_dir.clone(),
+                    config_files: container.config_files.clone(),
+                    is_self,
+                });
+            }
+        }
+        targets
+    };
+
+    let mut results: Vec<UpdateResultItem> = Vec::with_capacity(targets.len());
+    for target in targets {
+        let (success, message) = if target.is_self {
+            (false, "Refusing to update Cup's own container".to_string())
+        } else {
+            match run_compose_update(&target.working_dir, &target.config_files, &target.project).await
+            {
+                Ok(msg) => (true, msg),
+                Err(e) => (false, e),
+            }
+        };
+        results.push(UpdateResultItem {
+            reference: target.reference,
+            project: target.project,
+            working_dir: target.working_dir,
+            success,
+            message,
+        });
+    }
+
+    // Re-check so subsequent reads reflect the new state.
+    data.lock().await.refresh().await;
+
+    WebResponse::builder()
+        .header("Content-Type", "application/json")
+        .body(ResponseBody::from(
+            serde_json::json!({ "results": results }).to_string(),
+        ))
+        .unwrap()
+}
+
+/// Runs `docker compose pull` then `docker compose up -d` for one project.
+/// All arguments are passed as an array (no shell), so nothing can be injected.
+async fn run_compose_update(
+    working_dir: &str,
+    config_files: &str,
+    project: &str,
+) -> Result<String, String> {
+    let files: Vec<&str> = config_files
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let build = |args: &[&str]| {
+        let mut cmd = Command::new("docker");
+        cmd.arg("compose").args(["-p", project]);
+        for file in &files {
+            cmd.args(["-f", file]);
+        }
+        cmd.args(args).current_dir(working_dir);
+        cmd
+    };
+
+    let pull = build(&["pull"])
+        .output()
+        .await
+        .map_err(|e| format!("failed to run docker compose pull: {}", e))?;
+    if !pull.status.success() {
+        return Err(format!(
+            "pull failed: {}",
+            String::from_utf8_lossy(&pull.stderr).trim()
+        ));
+    }
+
+    let up = build(&["up", "-d"])
+        .output()
+        .await
+        .map_err(|e| format!("failed to run docker compose up -d: {}", e))?;
+    if !up.status.success() {
+        return Err(format!(
+            "up -d failed: {}",
+            String::from_utf8_lossy(&up.stderr).trim()
+        ));
+    }
+
+    let detail = String::from_utf8_lossy(&up.stderr);
+    let detail = detail.trim();
+    Ok(if detail.is_empty() {
+        "updated".to_string()
+    } else {
+        format!("updated — {}", detail)
+    })
 }
 
 struct ServerData {
@@ -278,8 +448,8 @@ where
     let method = request.method().to_string();
     let url = request.uri().to_string();
 
-    if &method != "GET" {
-        // We only allow GET requests
+    if &method != "GET" && &method != "POST" {
+        // We only allow GET and POST requests
 
         log(&method, &url, 405, elapsed(start));
         Err(Error::from(StatusCode::METHOD_NOT_ALLOWED))

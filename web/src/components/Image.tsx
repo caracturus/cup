@@ -13,6 +13,7 @@ import {
   Box,
   CircleArrowUp,
   CircleCheck,
+  FilePen,
   HelpCircle,
   Timer,
   TriangleAlert,
@@ -63,10 +64,18 @@ export default function Image({
         break;
     }
   }
-  // A row is selectable only if it has an update AND belongs to a compose project
-  // (otherwise there's no folder to run `docker compose` in).
+  const isComposeManaged = (data.compose?.length ?? 0) > 0;
+  // Only floating-tag (digest) updates can be applied with `docker compose pull && up -d`.
   const selectable =
-    data.result.has_update === true && (data.compose?.length ?? 0) > 0;
+    data.result.has_update === true &&
+    data.result.info?.type === "digest" &&
+    isComposeManaged;
+  // Version-pinned updates can't be applied that way — the compose file's tag must be
+  // edited by hand — so we show a hint instead of a checkbox.
+  const needsFileEdit =
+    data.result.has_update === true &&
+    data.result.info?.type === "version" &&
+    isComposeManaged;
   return (
     <>
       <li
@@ -79,6 +88,13 @@ export default function Image({
             aria-label={`Select ${data.reference} to update`}
             className="shrink-0"
           />
+        ) : needsFileEdit && data.result.info?.type === "version" ? (
+          <WithTooltip
+            text={`Version update — edit your compose file to ${data.result.info.new_tag}, then it can be applied`}
+            className={`size-4 shrink-0 text-${theme}-400`}
+          >
+            <FilePen className="size-4" />
+          </WithTooltip>
         ) : (
           // Keep icons/names aligned on rows without a checkbox
           <span className="w-4 shrink-0" aria-hidden="true" />

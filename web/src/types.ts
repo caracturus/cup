@@ -33,6 +33,7 @@ export interface Image {
 }
 
 export interface ComposeContainer {
+  id: string;
   name: string;
   service: string;
   project: string;

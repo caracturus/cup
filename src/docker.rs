@@ -197,6 +197,7 @@ pub async fn get_compose_containers(ctx: &Context) -> FxHashMap<String, Vec<Comp
             None => continue,
         };
         let compose_container = ComposeContainer {
+            id: container.id.clone().unwrap_or_default(),
             name: container
                 .names
                 .as_ref()

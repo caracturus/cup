@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[cfg_attr(test, derive(PartialEq))]
 pub struct ComposeContainer {
+    /// Full container ID (used to refuse updating Cup's own container).
+    pub id: String,
     /// Container name, e.g. `test-web` (Docker's leading `/` stripped).
     pub name: String,
     /// Compose service name (`com.docker.compose.service`).

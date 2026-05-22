@@ -254,6 +254,7 @@ pub async fn get_updates(
     let compose_map = get_compose_containers(ctx).await;
     for update in &mut updates {
         if let Some(containers) = compose_map.get(&update.reference) {
+            update.compose_managed = !containers.is_empty();
             update.compose = containers.clone();
         }
     }

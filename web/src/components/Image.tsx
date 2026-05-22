@@ -64,7 +64,7 @@ export default function Image({
         break;
     }
   }
-  const isComposeManaged = (data.compose?.length ?? 0) > 0;
+  const isComposeManaged = data.compose_managed;
   // Only floating-tag (digest) updates can be applied with `docker compose pull && up -d`.
   const selectable =
     data.result.has_update === true &&

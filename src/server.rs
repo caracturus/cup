@@ -227,6 +227,7 @@ async fn apply_updates(data: StateRef<'_, Arc<Mutex<ServerData>>>, body: String)
     // Best-effort own-container id (Docker sets HOSTNAME to the container id) so we can
     // refuse to update Cup itself, which would kill the process mid-request.
     let own_id = std::env::var("HOSTNAME").unwrap_or_default();
+    let logger = data.lock().await.ctx.logger.clone();
 
     // Resolve + validate targets under a short lock, then release it before running commands.
     let targets: Vec<UpdateTarget> = {
@@ -262,6 +263,16 @@ async fn apply_updates(data: StateRef<'_, Arc<Mutex<ServerData>>>, body: String)
         targets
     };
 
+    logger.info(format!(
+        "apply-updates: recreating {} compose project(s): [{}]",
+        targets.len(),
+        targets
+            .iter()
+            .map(|t| t.project.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+
     let mut results: Vec<UpdateResultItem> = Vec::with_capacity(targets.len());
     for target in targets {
         let (success, message) = if target.is_self {
@@ -273,6 +284,17 @@ async fn apply_updates(data: StateRef<'_, Arc<Mutex<ServerData>>>, body: String)
                 Err(e) => (false, e),
             }
         };
+        if success {
+            logger.info(format!(
+                "apply-updates: updated '{}' ({})",
+                target.project, target.reference
+            ));
+        } else {
+            logger.warn(format!(
+                "apply-updates: FAILED '{}' ({}): {}",
+                target.project, target.reference, message
+            ));
+        }
         results.push(UpdateResultItem {
             reference: target.reference,
             project: target.project,

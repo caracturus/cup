@@ -12,9 +12,13 @@ pub struct Update {
     pub time: u32,
     pub server: Option<String>,
     pub in_use: bool,
-    /// Compose-managed containers using this image (empty if none / not compose-managed).
-    /// `#[serde(default)]` so updates fetched from older remote Cup instances still deserialize.
-    #[serde(default)]
+    /// Whether this image belongs to a compose project (drives the UI checkbox).
+    /// This is the ONLY compose info exposed via the API.
+    pub compose_managed: bool,
+    /// Compose-managed containers using this image. Kept in memory for the update handler
+    /// but NOT serialized, so host paths / container IDs aren't leaked on the (commonly
+    /// unauthenticated) /api/ endpoints.
+    #[serde(skip_serializing, default)]
     pub compose: Vec<ComposeContainer>,
     #[serde(skip_serializing, skip_deserializing)]
     pub status: Status,

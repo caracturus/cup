@@ -29,16 +29,7 @@ export interface Image {
   time: number;
   server: string | null;
   in_use: boolean | null;
-  compose: ComposeContainer[];
-}
-
-export interface ComposeContainer {
-  id: string;
-  name: string;
-  service: string;
-  project: string;
-  working_dir: string;
-  config_files: string;
+  compose_managed: boolean;
 }
 
 interface VersionInfo {

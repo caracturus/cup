@@ -65,8 +65,76 @@ Two changes versus a stock Cup deployment:
 - **Audit trail:** every apply-updates request and per-project result is logged to
   Cup's container logs (`docker logs cup`).
 
-## Rolling back / staying current with upstream
+## Staying current with upstream Cup
 
-Work lives on the `feat/apply-updates` branch; `main` tracks upstream `sergi0g/cup`.
-To pick up a new Cup release: `git fetch upstream && git rebase upstream/main` on the
-feature branch, then rebuild.
+This fork is **upstream + our commits on top**, with two remotes:
+
+- `upstream` → `sergi0g/cup` (the original)
+- `origin` → your fork (e.g. `caracturus/cup`)
+
+Our work lives on the `feat/apply-updates` branch. "Updating" means replaying our
+commits on top of the newer upstream release.
+
+> If your deploy clone only has `origin`, add upstream first:
+> `git remote add upstream https://github.com/sergi0g/cup.git`
+
+### How you'll know there's an update
+
+Watch the [releases page](https://github.com/sergi0g/cup/releases) (GitHub → *Watch →
+Custom → Releases*), or just run `git fetch upstream --tags` periodically — new release
+tags will appear.
+
+### Update procedure (rebase — recommended)
+
+Do this in **one** clone (the one with both remotes), then sync the other:
+
+```bash
+git fetch upstream --tags                  # get new releases
+git checkout feat/apply-updates
+git rebase v3.6.0                          # ← use the NEW release tag, not main
+# resolve conflicts if prompted (see below), then:
+git push --force-with-lease origin feat/apply-updates
+```
+
+Then rebuild + redeploy on the host:
+
+```bash
+git fetch origin && git reset --hard origin/feat/apply-updates   # sync this clone
+docker build -t cup-apply-updates:latest .
+docker compose up -d
+```
+
+Rebase onto the release **tag** (`v3.6.x`), not `upstream/main` — tags are stable
+releases; `main` may contain unreleased work.
+
+### Handling conflicts
+
+A conflict only happens if upstream changed the same lines we did (most likely in
+`src/server.rs`, `src/docker.rs`, or the touched web components). Git pauses and marks
+the spots with `<<<<<<<` / `=======` / `>>>>>>>`. To resolve:
+
+1. Edit each marked file to keep the right combination of both changes.
+2. `git add <file>`
+3. `git rebase --continue`
+
+If it gets messy, **`git rebase --abort`** returns you safely to where you started.
+
+### Simpler alternative (merge — no force-push)
+
+If force-pushing feels risky, merge instead — slightly messier history, but it never
+rewrites it:
+
+```bash
+git fetch upstream --tags
+git checkout feat/apply-updates
+git merge v3.6.0          # resolve conflicts the same way, then it commits
+git push origin feat/apply-updates   # no --force needed
+```
+
+### Notes
+
+- Do the update in **one** clone, push to `origin`, then `git fetch && git reset --hard
+  origin/feat/apply-updates` on the other clone. Don't rebase the same branch in two
+  places independently.
+- Most updates should apply cleanly — our changes are mostly additive (new files) plus
+  small edits.

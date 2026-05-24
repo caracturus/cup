@@ -238,6 +238,12 @@ async fn apply_updates(data: StateRef<'_, Arc<Mutex<ServerData>>>, body: String)
             let Some(update) = guard.raw_updates.iter().find(|u| &u.reference == reference) else {
                 continue;
             };
+            // Never act on an update that belongs to another server: this central Cup can
+            // only run `docker compose` on its own host, so it can't recreate containers
+            // living on a remote VM. (Remote updates also carry no compose info anyway.)
+            if update.server.is_some() {
+                continue;
+            }
             // Only digest (floating-tag) updates can be applied with pull && up -d.
             let is_digest = matches!(update.result.info, UpdateInfo::Digest(_));
             if update.result.has_update != Some(true) || !is_digest {

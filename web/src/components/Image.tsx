@@ -65,14 +65,20 @@ export default function Image({
     }
   }
   const isComposeManaged = data.compose_managed;
-  // Only floating-tag (digest) updates can be applied with `docker compose pull && up -d`.
+  // Updates on another server are read-only here: the central Cup runs `docker compose`
+  // on its own host, so it can't apply changes to a container living on a remote VM.
+  // Those rows show status only (update them on that VM directly).
+  const isLocal = !data.server;
+  // Only local floating-tag (digest) updates can be applied with `docker compose pull && up -d`.
   const selectable =
+    isLocal &&
     data.result.has_update === true &&
     data.result.info?.type === "digest" &&
     isComposeManaged;
   // Version-pinned updates can't be applied that way — the compose file's tag must be
   // edited by hand — so we show a hint instead of a checkbox.
   const needsFileEdit =
+    isLocal &&
     data.result.has_update === true &&
     data.result.info?.type === "version" &&
     isComposeManaged;

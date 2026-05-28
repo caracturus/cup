@@ -1,0 +1,45 @@
+---
+services:
+  cup:
+    image: cup-apply-updates:latest
+    # image: ghcr.io/sergi0g/cup:latest
+    container_name: cup # Optional
+    restart: unless-stopped
+    command: -c /config/cup.json serve
+    # ports:
+    #  - 8000:8000
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /home/caradoc/docker/cup/cup.json:/config/cup.json
+      - /home/caradoc/docker-compose:/home/caradoc/docker-compose
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+
+      # --- HTTP Router for Redirect ---
+      - "traefik.http.routers.cup.entrypoints=http"
+      - "traefik.http.routers.cup.rule=Host(`cup.boydenclan.com`)"
+      - "traefik.http.middlewares.cup-https-redirect.redirectscheme.scheme=https"
+      - "traefik.http.routers.cup.middlewares=cup-https-redirect"
+
+      # --- HTTPS Router for Authenticated Web Access ---
+      - "traefik.http.routers.cup-secure.entrypoints=https"
+      - "traefik.http.routers.cup-secure.rule=Host(`cup.boydenclan.com`)"
+      - "traefik.http.routers.cup-secure.tls=true"
+      - "traefik.http.routers.cup-secure.service=cup"
+      - "traefik.http.routers.cup-secure.middlewares=authentik@file"
+
+      # --- HTTPS Router for API (No Auth) ---
+      - "traefik.http.routers.cup-api.entrypoints=https"
+      - "traefik.http.routers.cup-api.rule=Host(`cup.boydenclan.com`) && PathPrefix(`/api/`)"
+      - "traefik.http.routers.cup-api.tls=true"
+      - "traefik.http.routers.cup-api.service=cup"
+
+      # --- Service ---
+      - "traefik.http.services.cup.loadbalancer.server.port=8000"
+      - "traefik.docker.network=proxy"
+
+networks:
+  proxy:
+    external: true

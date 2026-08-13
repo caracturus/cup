@@ -127,7 +127,7 @@ pub async fn get_token(
     auth_url: &str,
     credentials: &Option<String>,
     client: &Client,
-) -> String {
+) -> Result<String, String> {
     let mut url = auth_url.to_owned();
     for repository in repositories {
         url = format!("{}&scope=repository:{}:pull", url, repository);
@@ -135,12 +135,19 @@ pub async fn get_token(
     let authorization = credentials.as_ref().map(|creds| format!("Basic {}", creds));
     let headers = [("Authorization", authorization.as_deref())];
 
-    let response = client.get(&url, &headers, false).await;
-    let response_json = match response {
-        Ok(response) => parse_json(&get_response_body(response).await),
-        Err(_) => error!("GET {}: Request failed!", url),
-    };
-    response_json["token"].as_str().unwrap().to_string()
+    // A failed token request (e.g. the registry returns 403/429 for the token
+    // endpoint) must not be fatal. Exiting here takes down the whole server over a
+    // single unreachable registry, and under `restart: unless-stopped` that becomes a
+    // crash loop. Propagate the error so the caller can skip this registry's images.
+    let response = client.get(&url, &headers, false).await?;
+    let response_json = parse_json(&get_response_body(response).await);
+    match response_json["token"].as_str() {
+        Some(token) => Ok(token.to_string()),
+        None => Err(format!(
+            "GET {}: Registry did not include a token in its response.",
+            url
+        )),
+    }
 }
 
 pub async fn get_latest_tag(
@@ -407,7 +414,9 @@ mod tests {
 
         let mut tokens: Vec<(&str, String)> = Vec::new();
         for batch in batch_repositories(&images) {
-            let token = get_token(&batch, &auth_url, &None, &client).await;
+            let token = get_token(&batch, &auth_url, &None, &client)
+                .await
+                .expect("the token endpoint should answer");
             let header_len = "Authorization: Bearer ".len() + token.len();
             println!(
                 "batch of {} repositories -> {} byte header",

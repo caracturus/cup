@@ -1,4 +1,5 @@
 use std::fmt::Display;
+use std::time::Duration;
 
 use reqwest::Response;
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
@@ -26,10 +27,32 @@ pub struct Client {
     ctx: Context,
 }
 
+/// How long to wait for a TCP connection to be established.
+///
+/// Without this, a host that is down or silently dropping packets sits in the kernel's SYN
+/// retry loop for over two minutes before `reqwest` reports a failure — multiplied by the
+/// retry middleware below.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Upper bound on a single request, from start to response body.
+///
+/// `reqwest` applies **no** timeout by default, so a peer that completes the handshake and
+/// then never answers blocks the caller forever. Generous enough for a remote Cup instance
+/// running its own registry check in response to `/api/v3/refresh`.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
 impl Client {
     pub fn new(ctx: &Context) -> Self {
+        let inner = match reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+        {
+            Ok(client) => client,
+            Err(e) => error!("Failed to build the HTTP client: {}", e),
+        };
         Self {
-            inner: ClientBuilder::new(reqwest::Client::new())
+            inner: ClientBuilder::new(inner)
                 .with(RetryTransientMiddleware::new_with_policy(
                     ExponentialBackoff::builder().build_with_max_retries(3),
                 ))

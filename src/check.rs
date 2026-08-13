@@ -181,6 +181,9 @@ pub async fn get_updates(
 
     // Retrieve an authentication token (if required) for each registry.
     let mut tokens: FxHashMap<&str, Option<String>> = FxHashMap::default();
+    // Registries whose token could not be fetched (e.g. the token endpoint returned
+    // 403/429). Their images are surfaced as errored rather than crashing the run.
+    let mut token_errors: FxHashMap<&str, String> = FxHashMap::default();
     for registry in registries.clone() {
         let credentials = if let Some(registry_config) = ctx.config.registries.get(registry) {
             &registry_config.authentication
@@ -189,14 +192,21 @@ pub async fn get_updates(
         };
         match check_auth(registry, ctx, &client).await {
             Some(auth_url) => {
-                let token = get_token(
+                match get_token(
                     image_map.get(registry).unwrap(),
                     &auth_url,
                     credentials,
                     &client,
                 )
-                .await;
-                tokens.insert(registry, Some(token));
+                .await
+                {
+                    Ok(token) => {
+                        tokens.insert(registry, Some(token));
+                    }
+                    Err(error) => {
+                        token_errors.insert(registry, error);
+                    }
+                }
             }
             None => {
                 tokens.insert(registry, None);
@@ -207,6 +217,9 @@ pub async fn get_updates(
     ctx.logger.debug(format!("Tokens: {:?}", tokens));
 
     let mut handles = Vec::with_capacity(images.len());
+    // Images belonging to a registry whose token fetch failed. They're surfaced with
+    // the token error instead of being checked (which would only fail again).
+    let mut errored_images: Vec<Image> = Vec::new();
 
     // Loop through images check for updates
     for image in &images {
@@ -218,6 +231,13 @@ pub async fn get_updates(
                 .iter()
                 .any(|item| image.reference.starts_with(item));
         if !is_ignored {
+            if let Some(error) = token_errors.get(image.parts.registry.as_str()) {
+                errored_images.push(Image {
+                    error: Some(error.clone()),
+                    ..image.clone()
+                });
+                continue;
+            }
             let excluded_tags = get_excluded_tags(image, ctx);
             let token = tokens.get(image.parts.registry.as_str()).unwrap();
             let future = image.check(token.as_deref(), ctx, &client, excluded_tags);
@@ -225,7 +245,8 @@ pub async fn get_updates(
         }
     }
     // Await all the futures
-    let images = join_all(handles).await;
+    let mut images = join_all(handles).await;
+    images.extend(errored_images);
     let mut updates: Vec<Update> = images.iter().map(|image| image.to_update()).collect();
     updates.extend_from_slice(&remote_updates);
     updates

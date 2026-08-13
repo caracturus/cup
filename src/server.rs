@@ -12,7 +12,7 @@ use xitca_web::{
     bytes::Bytes,
     error::Error,
     handler::{handler_service, path::PathRef, state::StateRef},
-    http::{StatusCode, WebResponse},
+    http::{StatusCode, WebRequest, WebResponse},
     route::{get, post},
     service::Service,
     App, WebContext,
@@ -205,6 +205,68 @@ struct UpdateTarget {
     is_self: bool,
 }
 
+/// CSRF protection for the privileged `/actions/update` route.
+///
+/// Returns `Some(response)` (403) when the request doesn't look like it originated from
+/// the Cup UI on this same origin, so the caller can short-circuit before doing work;
+/// `None` means the request may proceed.
+///
+/// Two layers:
+///  1. Require `Content-Type: application/json`. A cross-site HTML `<form>` can't set
+///     that Content-Type, and a cross-origin `fetch` that does triggers a CORS
+///     preflight (`OPTIONS`) which this server rejects (405) — so this alone blocks the
+///     common CSRF vectors. The Cup UI already sends this header.
+///  2. When the browser supplies an `Origin` (or `Referer`) header, require its host to
+///     match the `Host` the request was addressed to (same-origin). Requests with
+///     neither header (e.g. curl, server-to-server) are allowed through — those aren't
+///     browser-driven CSRF.
+fn reject_if_cross_origin(req: &WebRequest<()>) -> Option<WebResponse> {
+    let headers = req.headers();
+    let forbid = |msg: &str| {
+        Some(
+            WebResponse::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(ResponseBody::from(msg.to_string()))
+                .unwrap(),
+        )
+    };
+
+    // 1. Content-Type must be application/json (ignoring any `; charset=...` params).
+    let media_type = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim();
+    if !media_type.eq_ignore_ascii_case("application/json") {
+        return forbid("Content-Type must be application/json");
+    }
+
+    // 2. If present, the Origin/Referer host must match the Host header.
+    let source_host = headers
+        .get("origin")
+        .or_else(|| headers.get("referer"))
+        .and_then(|v| v.to_str().ok())
+        .and_then(authority_of);
+    if let Some(source_host) = source_host {
+        let host = headers.get("host").and_then(|v| v.to_str().ok());
+        if host.map(|h| h.eq_ignore_ascii_case(&source_host)) != Some(true) {
+            return forbid("Cross-origin request rejected");
+        }
+    }
+
+    None
+}
+
+/// Extracts the `host[:port]` authority from a URL such as `http://host:8000/path`.
+fn authority_of(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    (!authority.is_empty()).then(|| authority.to_string())
+}
+
 /// POST /actions/update — applies floating-tag (digest) updates by running
 /// `docker compose pull && docker compose up -d` in each selected project's folder.
 ///
@@ -213,7 +275,18 @@ struct UpdateTarget {
 /// each reference currently has a digest update and is compose-managed, and runs commands
 /// via an argument array (no shell). In production this route MUST sit behind authentication
 /// (it is intentionally not under /api/, which is commonly left unauthenticated).
-async fn apply_updates(data: StateRef<'_, Arc<Mutex<ServerData>>>, body: String) -> WebResponse {
+async fn apply_updates(
+    http_req: &WebRequest<()>,
+    data: StateRef<'_, Arc<Mutex<ServerData>>>,
+    body: String,
+) -> WebResponse {
+    // CSRF protection: this route runs privileged, state-changing commands
+    // (docker compose pull && up -d). Reject anything that isn't a same-origin JSON
+    // request from the Cup UI *before* parsing the body, locking, or running anything.
+    if let Some(response) = reject_if_cross_origin(http_req) {
+        return response;
+    }
+
     let req: UpdateRequest = match serde_json::from_str(&body) {
         Ok(req) => req,
         Err(e) => {
@@ -502,4 +575,37 @@ fn log(method: &str, url: &str, status: u16, time: u32) {
         "\x1b[94;1m HTTP \x1b[0m\x1b[32m{}\x1b[0m {} {}{}\x1b[0m in {}ms",
         method, url, color, status, time
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::authority_of;
+
+    #[test]
+    fn authority_of_extracts_host_and_port() {
+        // Origin-style values (scheme + authority, no path).
+        assert_eq!(
+            authority_of("http://example.com:8000"),
+            Some("example.com:8000".to_string())
+        );
+        assert_eq!(
+            authority_of("https://example.com"),
+            Some("example.com".to_string())
+        );
+        assert_eq!(
+            authority_of("http://10.0.0.5:8000"),
+            Some("10.0.0.5:8000".to_string())
+        );
+        // Referer-style values carry a path/query/fragment we must strip.
+        assert_eq!(
+            authority_of("http://host:8000/a/b?x=1#frag"),
+            Some("host:8000".to_string())
+        );
+        // `Origin: null` (sandboxed/file origins) parses to a host that will never
+        // match a real Host header, so it is correctly rejected downstream.
+        assert_eq!(authority_of("null"), Some("null".to_string()));
+        // Degenerate inputs yield no authority.
+        assert_eq!(authority_of(""), None);
+        assert_eq!(authority_of("http://"), None);
+    }
 }

@@ -1,0 +1,57 @@
+name: Agent Image
+
+# Publishes the image the LAN agents run: upstream Cup plus the two availability
+# fixes on this branch (HTTP timeouts, non-fatal registry 429). Deliberately built
+# from upstream's `FROM scratch` Dockerfile rather than the apply-updates fork, so
+# the agents get no docker CLI and no privileged /actions/update route.
+#
+# Retire this once the fixes are released upstream and the agents can go back to
+# ghcr.io/sergi0g/cup:latest.
+
+on:
+  push:
+    branches: [agent-image]
+  workflow_dispatch:
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/cup
+          tags: |
+            type=raw,value=agent
+            type=sha,prefix=agent-,format=short
+
+      # The agents are x86_64 VMs, so amd64 only — building arm64 here would mean
+      # emulating a full Rust release build under QEMU for no one's benefit.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

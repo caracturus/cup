@@ -103,6 +103,13 @@ impl Client {
                     );
                     self.ctx.logger.warn(&message);
                     Err(message)
+                } else if status == 429 {
+                    let message = format!(
+                        "{} {}: Rate limited by the registry (returned status code 429). Skipping this check.",
+                        method, url
+                    );
+                    self.ctx.logger.warn(&message);
+                    Err(message)
                 } else if status.as_u16() <= 400 {
                     Ok(response)
                 } else {

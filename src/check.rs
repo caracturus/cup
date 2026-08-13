@@ -18,11 +18,11 @@ use crate::{
 
 /// Upper bound on how long we'll wait for a single remote Cup instance.
 ///
-/// Deliberately generous, because `/api/v3/refresh` makes the remote run its own full
-/// registry check before it answers. But it must exist: `serve()` does not bind its port
-/// until the first check finishes, so a single wedged peer would otherwise stop Cup from
-/// ever starting.
-const REMOTE_SERVER_TIMEOUT: Duration = Duration::from_secs(90);
+/// Generous, because `/api/v3/refresh` makes the remote run its own full registry check
+/// before it answers — a healthy agent here answers in about a second, so this is ~30x
+/// headroom. But it must exist: `serve()` does not bind its port until the first check
+/// finishes, so a single wedged peer would otherwise stop Cup from ever starting.
+const REMOTE_SERVER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Fetches image data from a single remote Cup instance.
 async fn get_server_updates(

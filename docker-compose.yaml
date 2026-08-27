@@ -3,6 +3,11 @@ services:
   cup:
     image: cup-apply-updates:latest
     # image: ghcr.io/sergi0g/cup:latest
+    # This image is built from this checkout, not pulled — without `build` here,
+    # `docker compose up -d` silently keeps running the previous binary.
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: cup # Optional
     restart: unless-stopped
     command: -c /config/cup.json serve

@@ -7,7 +7,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::{
     docker::{get_images_from_docker_daemon, get_in_use_images},
     http::Client,
-    registry::{check_auth, get_token},
+    registry::{batch_repositories, check_auth, get_token},
     structs::{image::Image, update::Update},
     utils::{
         reference::split,
@@ -236,27 +236,36 @@ pub async fn get_updates(
             .push(image);
     }
 
-    // Retrieve an authentication token (if required) for each registry.
-    let mut tokens: FxHashMap<&str, Option<String>> = FxHashMap::default();
+    // Retrieve authentication tokens (if required) for each registry.
+    //
+    // Keyed by (registry, repository) rather than by registry: a registry's repositories
+    // are split across several tokens so no single token can grow past the header size a
+    // registry will accept. See `MAX_REPOSITORIES_PER_TOKEN`.
+    let mut tokens: FxHashMap<(&str, &str), Option<String>> = FxHashMap::default();
     for registry in registries.clone() {
         let credentials = if let Some(registry_config) = ctx.config.registries.get(registry) {
             &registry_config.authentication
         } else {
             &None
         };
+        let registry_images = image_map.get(registry).unwrap();
         match check_auth(registry, ctx, &client).await {
             Some(auth_url) => {
-                let token = get_token(
-                    image_map.get(registry).unwrap(),
-                    &auth_url,
-                    credentials,
-                    &client,
-                )
-                .await;
-                tokens.insert(registry, Some(token));
+                for batch in batch_repositories(registry_images) {
+                    let token = get_token(&batch, &auth_url, credentials, &client).await;
+                    for repository in batch {
+                        tokens.insert((registry, repository), Some(token.clone()));
+                    }
+                }
             }
             None => {
-                tokens.insert(registry, None);
+                for repository in registry_images
+                    .iter()
+                    .map(|image| image.parts.repository.as_str())
+                    .unique()
+                {
+                    tokens.insert((registry, repository), None);
+                }
             }
         }
     }
@@ -275,9 +284,16 @@ pub async fn get_updates(
                 .iter()
                 .any(|item| image.reference.starts_with(item));
         if !is_ignored {
+            let key = (
+                image.parts.registry.as_str(),
+                image.parts.repository.as_str(),
+            );
             let excluded_tags = get_excluded_tags(image, ctx);
-            let token = tokens.get(image.parts.registry.as_str()).unwrap();
-            let future = image.check(token.as_deref(), ctx, &client, excluded_tags);
+            let token = match tokens.get(&key) {
+                Some(token) => token.as_deref(),
+                None => None,
+            };
+            let future = image.check(token, ctx, &client, excluded_tags);
             handles.push(future);
         }
     }

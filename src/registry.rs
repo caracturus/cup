@@ -66,6 +66,17 @@ pub async fn get_latest_digest(
         "Checked for digest update to {} in {}ms",
         image.reference, time
     ));
+    // A response we can't read a digest out of costs this one image its freshness — it must
+    // never cost the process. `error!` is `std::process::exit(1)`, so under
+    // `restart: unless-stopped` bailing out here becomes a crash loop in which *nothing*
+    // gets checked, which is exactly how one odd answer took the whole instance down on
+    // 2026-08-27.
+    let errored = |message: String| Image {
+        error: Some(message),
+        time_ms: image.time_ms + time,
+        ..image.clone()
+    };
+
     match response {
         Ok(res) => match res.headers().get("docker-content-digest") {
             Some(digest) => {
@@ -73,25 +84,37 @@ pub async fn get_latest_digest(
                     Some(data) => data.local_digests.clone(),
                     None => return image.clone(),
                 };
+                let remote_digest = match digest.to_str() {
+                    Ok(digest) => digest.to_string(),
+                    Err(_) => {
+                        let message = format!(
+                            "{}: docker-content-digest is not readable text: {:?}",
+                            url, digest
+                        );
+                        ctx.logger.warn(&message);
+                        return errored(message);
+                    }
+                };
                 Image {
                     digest_info: Some(DigestInfo {
-                        remote_digest: Some(digest.to_str().unwrap().to_string()),
+                        remote_digest: Some(remote_digest),
                         local_digests,
                     }),
                     time_ms: image.time_ms + time,
                     ..image.clone()
                 }
             }
-            None => error!(
-                "Server returned invalid response! No docker-content-digest!\n{:#?}",
-                res
-            ),
+            None => {
+                let message = format!(
+                    "{}: server returned no docker-content-digest\n{:#?}",
+                    url, res
+                );
+                ctx.logger.warn(&message);
+                errored(message)
+            }
         },
-        Err(error) => Image {
-            error: Some(error),
-            time_ms: image.time_ms + time,
-            ..image.clone()
-        },
+        // `Client::request` has already logged this one.
+        Err(error) => errored(error),
     }
 }
 
@@ -315,6 +338,8 @@ pub async fn get_extra_tags(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{Config, RegistryConfig};
+    use crate::logging::Logger;
 
     fn images(references: &[String]) -> Vec<Image> {
         references
@@ -472,6 +497,114 @@ mod tests {
             MAX_REPOSITORIES_PER_TOKEN,
             worst_case,
             REGISTRY_HEADER_LIMIT
+        );
+    }
+
+    /// Spins up a listener that answers every request with `raw_response`, points `image`
+    /// at it, and returns the result of checking that image.
+    async fn check_against_registry_answering(image: &Image, raw_response: &'static [u8]) -> Image {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buffer = [0u8; 2048];
+                    let _ = stream.read(&mut buffer).await;
+                    let _ = stream.write_all(raw_response).await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+
+        let mut config = Config::new();
+        config.registries.insert(
+            addr.to_string(),
+            RegistryConfig {
+                insecure: true,
+                ..Default::default()
+            },
+        );
+        let ctx = Context {
+            config,
+            logger: Logger::new(false, false),
+        };
+        let client = Client::new(&ctx);
+        let mut image = image.clone();
+        let (registry, repository, tag) = crate::utils::reference::split(&format!(
+            "{}/{}:{}",
+            addr, image.parts.repository, image.parts.tag
+        ));
+        image.parts = crate::structs::parts::Parts {
+            registry,
+            repository,
+            tag,
+        };
+
+        get_latest_digest(&image, None, &ctx, &client).await
+    }
+
+    /// An image the daemon knows the local digest of — the shape `get_latest_digest`
+    /// actually compares against, and the only one that reads the digest header's value.
+    fn image_with_local_digest() -> Image {
+        let mut image = Image::from_reference("library/nginx:1.0.0");
+        image.digest_info = Some(DigestInfo {
+            local_digests: vec!["sha256:aaaa".to_string()],
+            remote_digest: None,
+        });
+        image
+    }
+
+    /// Regression test for the crash loop of 2026-08-27.
+    ///
+    /// A response Cup considers successful but that carries no `docker-content-digest` —
+    /// a proxy or gateway answering 200 with an error page, say — fell through to the
+    /// `error!` macro, which is `std::process::exit(1)`. Under `restart: unless-stopped`
+    /// that turns one odd response into an endless restart loop in which *no* image gets
+    /// checked. A bad answer must cost that one image its freshness, not the process.
+    ///
+    /// (Statuses >= 400 no longer reach here at all — `Client::request` turns those into
+    /// `Err` since `e62c538` — but a 2xx without the header still did.)
+    #[tokio::test]
+    async fn manifest_without_digest_header_errors_the_image_instead_of_exiting() {
+        let image = check_against_registry_answering(
+            &image_with_local_digest(),
+            b"HTTP/1.1 200 OK\r\n\
+              content-type: text/html\r\n\
+              content-length: 0\r\n\r\n",
+        )
+        .await;
+
+        assert!(
+            image.error.is_some(),
+            "a successful response with no digest header should mark the image errored"
+        );
+        assert!(
+            image
+                .digest_info
+                .as_ref()
+                .is_none_or(|info| info.remote_digest.is_none()),
+            "no remote digest should be recorded from a failed check"
+        );
+    }
+
+    /// The same crash loop through a different door: the digest header is present but its
+    /// value isn't valid UTF-8, so `to_str()` fails. That used to be an `unwrap()`, and the
+    /// release profile sets `panic = "abort"`, so it killed the process just as surely.
+    #[tokio::test]
+    async fn manifest_with_unreadable_digest_header_errors_the_image_instead_of_panicking() {
+        let image = check_against_registry_answering(
+            &image_with_local_digest(),
+            b"HTTP/1.1 200 OK\r\n\
+              docker-content-digest: \xff\xfe\r\n\
+              content-length: 0\r\n\r\n",
+        )
+        .await;
+
+        assert!(
+            image.error.is_some(),
+            "an unreadable digest header should mark the image errored"
         );
     }
 }

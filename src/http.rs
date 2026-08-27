@@ -110,21 +110,29 @@ impl Client {
                     );
                     self.ctx.logger.warn(&message);
                     Err(message)
-                } else if status.as_u16() <= 400 {
+                } else if status.as_u16() < 400 {
                     Ok(response)
                 } else {
-                    match method {
-                        RequestMethod::GET => error!(
+                    // Anything else is still a failed request: the body is an error page,
+                    // not a manifest or a tag list. Handing it back as `Ok` made callers
+                    // parse an error page and then kill the process over the "invalid"
+                    // response it obviously was. One bad answer from one registry must cost
+                    // us one image, not the whole run — under `restart: unless-stopped`
+                    // exiting here turns into a crash loop.
+                    let message = match method {
+                        RequestMethod::GET => format!(
                             "{} {}: Unexpected error: {}",
                             method,
                             url,
-                            response.text().await.unwrap()
+                            response.text().await.unwrap_or_default()
                         ),
-                        RequestMethod::HEAD => error!(
-                            "{} {}: Unexpected error: Recieved status code {}",
+                        RequestMethod::HEAD => format!(
+                            "{} {}: Unexpected error: Received status code {}",
                             method, url, status
                         ),
-                    }
+                    };
+                    self.ctx.logger.warn(&message);
+                    Err(message)
                 }
             }
             Err(error) => {
@@ -168,5 +176,80 @@ impl Client {
         headers: &[(&str, Option<&str>)],
     ) -> Result<Response, String> {
         self.request(url, RequestMethod::HEAD, headers, false).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{config::Config, logging::Logger};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Serves `response` verbatim to every connection and returns the address to hit.
+    async fn serve_canned_response(response: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buffer = [0u8; 4096];
+                    let _ = stream.read(&mut buffer).await;
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+        format!("http://{}/v2/library/alpine/manifests/latest", addr)
+    }
+
+    fn client() -> Client {
+        let ctx = Context {
+            config: Config::new(),
+            logger: Logger::new(false, false),
+        };
+        Client::new(&ctx)
+    }
+
+    /// Regression test for the crash loop of 2026-08-27.
+    ///
+    /// The load balancer in front of `registry-1.docker.io` answers a request whose header
+    /// line exceeds 16 KiB with this exact response. Cup treated any status up to *and
+    /// including* 400 as a success, so the HTML error page was handed to the caller as if
+    /// it were a manifest; the caller then found no `docker-content-digest` on it and
+    /// killed the process. A 400 is a failed request and must be reported as one.
+    #[tokio::test]
+    async fn a_400_is_an_error_not_a_successful_response() {
+        let url = serve_canned_response(
+            "HTTP/1.1 400 Bad Request\r\nServer: awselb/2.0\r\nContent-Type: text/html\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+
+        let result = client().head(&url, &[]).await;
+
+        assert!(
+            result.is_err(),
+            "a 400 should be surfaced as an error, got status {:?}",
+            result.map(|response| response.status())
+        );
+    }
+
+    /// Any other unhandled error status used to reach `error!`, which calls
+    /// `std::process::exit(1)` — one unexpected answer from one registry took down a server
+    /// that was still perfectly able to check every other image. This test would abort the
+    /// whole test binary if that ever came back.
+    #[tokio::test]
+    async fn an_unhandled_error_status_does_not_kill_the_process() {
+        let url = serve_canned_response(
+            "HTTP/1.1 418 I'm a teapot\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+
+        let result = client().head(&url, &[]).await;
+
+        assert!(
+            result.is_err(),
+            "an unhandled error status should be surfaced as an error, got status {:?}",
+            result.map(|response| response.status())
+        );
     }
 }

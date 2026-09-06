@@ -13,12 +13,14 @@ import {
   Box,
   CircleArrowUp,
   CircleCheck,
+  FilePen,
   HelpCircle,
   Timer,
   TriangleAlert,
   X,
 } from "lucide-react";
 import Badge from "./Badge";
+import { Checkbox } from "./ui/Checkbox";
 import { getDescription } from "../utils";
 
 const clickable_registries = [
@@ -28,7 +30,15 @@ const clickable_registries = [
   "gcr.io",
 ]; // Not all registries redirect to an info page when visiting the image reference in a browser (e.g. Gitea and derivatives), so we only enable clicking those who do.
 
-export default function Image({ data }: { data: Image }) {
+export default function Image({
+  data,
+  checked,
+  onToggle,
+}: {
+  data: Image;
+  checked: boolean;
+  onToggle: (reference: string) => void;
+}) {
   const [open, setOpen] = useState(false);
   const handleOpen = () => {
     setOpen(true);
@@ -54,11 +64,50 @@ export default function Image({ data }: { data: Image }) {
         break;
     }
   }
+  const isComposeManaged = data.compose_managed;
+  // Updates on another server are read-only here: the central Cup runs `docker compose`
+  // on its own host, so it can't apply changes to a container living on a remote VM.
+  // Those rows show status only (update them on that VM directly).
+  const isLocal = !data.server;
+  // Only local floating-tag (digest) updates can be applied with `docker compose pull && up -d`.
+  const selectable =
+    isLocal &&
+    data.result.has_update === true &&
+    data.result.info?.type === "digest" &&
+    isComposeManaged;
+  // Version-pinned updates can't be applied that way — the compose file's tag must be
+  // edited by hand — so we show a hint instead of a checkbox.
+  const needsFileEdit =
+    isLocal &&
+    data.result.has_update === true &&
+    data.result.info?.type === "version" &&
+    isComposeManaged;
   return (
     <>
-      <button onClick={handleOpen} className="w-full">
-        <li
-          className={`flex items-center gap-4 break-all px-6 py-4 text-start hover:bg-${theme}-100 hover:dark:bg-${theme}-900/50 transition-colors duration-200`}
+      <li
+        className={`flex items-center gap-4 break-all px-6 py-4 hover:bg-${theme}-100 hover:dark:bg-${theme}-900/50 transition-colors duration-200`}
+      >
+        {selectable ? (
+          <Checkbox
+            checked={checked}
+            onCheckedChange={() => onToggle(data.reference)}
+            aria-label={`Select ${data.reference} to update`}
+            className="shrink-0"
+          />
+        ) : needsFileEdit && data.result.info?.type === "version" ? (
+          <WithTooltip
+            text={`Version update — edit your compose file to ${data.result.info.new_tag}, then it can be applied`}
+            className={`size-4 shrink-0 text-${theme}-400`}
+          >
+            <FilePen className="size-4" />
+          </WithTooltip>
+        ) : (
+          // Keep icons/names aligned on rows without a checkbox
+          <span className="w-4 shrink-0" aria-hidden="true" />
+        )}
+        <button
+          onClick={handleOpen}
+          className="flex min-w-0 flex-1 items-center gap-4 text-start"
         >
           <Box className={`size-6 shrink-0 text-${theme}-500`} />
           <span className="font-mono">{data.reference}</span>
@@ -76,8 +125,8 @@ export default function Image({ data }: { data: Image }) {
               <info.icon />
             </WithTooltip>
           </div>
-        </li>
-      </button>
+        </button>
+      </li>
       <Dialog open={open} onClose={setOpen} className="relative z-10">
         <DialogBackdrop
           transition

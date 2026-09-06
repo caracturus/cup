@@ -9,6 +9,14 @@
 
 Cup is the easiest way to check for container image updates.
 
+> [!NOTE]
+> **This is a fork** of [sergi0g/cup](https://github.com/sergi0g/cup) that adds an
+> **"apply updates" button** to the web UI: tick the images with an available update
+> and click **Update**, and Cup runs `docker compose pull && up -d` in each one's
+> compose project folder. See [Applying updates](#applying-updates-fork-addition)
+> below and the [deployment guide](./deploy/README.md). All other behaviour is
+> unchanged from upstream.
+
 ![Cup web in dark mode](screenshots/web_dark.png)
 
 _If you like this project and/or use Cup, please consider starring the project ⭐. It motivates me to continue working on it and improving it. Plus, you get updates for new releases!_
@@ -26,6 +34,18 @@ _If you like this project and/or use Cup, please consider starring the project �
 - Beautiful CLI and web interface for checking on your containers any time.
 - The binary is tiny! At the time of writing it's just 5.4 MB. No more pulling 100+ MB docker images for a such a simple program.
 - JSON output for both the CLI and web interface so you can connect Cup to integrations. It's easy to parse and makes webhooks and pretty dashboards simple to set up!
+
+## Applying updates (fork addition)
+
+This fork adds a way to *act on* the updates Cup finds, directly from the web UI:
+
+1. Cup reads each running container's `com.docker.compose.*` labels to learn its compose project folder.
+2. Rows that have a **floating-tag (digest) update** and are compose-managed get a checkbox on the left. Tick the ones you want, and an action bar appears with an **Update** button.
+3. Clicking **Update** (after a confirmation) runs `docker compose pull && docker compose up -d` in each selected project's folder, then shows a per-stack result.
+
+**Scope:** only floating-tag updates (e.g. `:latest`) are applied — those are the ones `docker compose pull` can actually move. Version-pinned rows (e.g. `:v1.2.3`) show a hint to edit the tag in your compose file by hand instead.
+
+**Requirements & security:** the image now bundles the docker CLI + compose plugin, and you mount your compose-projects directory into the container. The update endpoint (`POST /actions/update`) is intentionally **not** under `/api/`, so it must be kept behind authentication. Full setup and a security checklist are in [`deploy/README.md`](./deploy/README.md).
 
 ## Documentation 📘
 

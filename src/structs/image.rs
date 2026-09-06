@@ -223,6 +223,8 @@ impl Image {
             time: self.time_ms,
             server: None,
             in_use: self.in_use,
+            compose_managed: false, // set in check::get_updates
+            compose: Vec::new(), // filled in by check::get_updates from container labels
             status: has_update,
         }
     }

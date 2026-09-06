@@ -1,11 +1,13 @@
+use std::time::Duration;
+
 use futures::future::join_all;
 use itertools::Itertools;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
-    docker::{get_images_from_docker_daemon, get_in_use_images},
+    docker::{get_compose_containers, get_images_from_docker_daemon, get_in_use_images},
     http::Client,
-    registry::{check_auth, get_token},
+    registry::{batch_repositories, check_auth, get_token},
     structs::{image::Image, update::Update},
     utils::{
         reference::split,
@@ -14,63 +16,118 @@ use crate::{
     Context,
 };
 
+/// Upper bound on how long we'll wait for a single remote Cup instance.
+///
+/// Generous, because `/api/v3/refresh` makes the remote run its own full registry check
+/// before it answers — a healthy agent here answers in about a second, so this is ~30x
+/// headroom. But it must exist: `serve()` does not bind its port until the first check
+/// finishes, so a single wedged peer would otherwise stop Cup from ever starting.
+const REMOTE_SERVER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Fetches image data from a single remote Cup instance.
+async fn get_server_updates(
+    ctx: &Context,
+    client: &Client,
+    name: &str,
+    url: &str,
+    refresh: bool,
+) -> Vec<Update> {
+    let base_url = if url.starts_with("http://") || url.starts_with("https://") {
+        format!("{}/api/v3/", url.trim_end_matches('/'))
+    } else {
+        format!("https://{}/api/v3/", url.trim_end_matches('/'))
+    };
+    let json_url = base_url.clone() + "json";
+    if refresh {
+        let refresh_url = base_url + "refresh";
+        match client.get(&refresh_url, &[], false).await {
+            Ok(response) => {
+                if response.status() != 200 {
+                    ctx.logger.warn(format!("GET {}: Failed to refresh server. Server returned invalid response code: {}", refresh_url, response.status()));
+                    return Vec::new();
+                }
+            }
+            Err(e) => {
+                ctx.logger.warn(format!(
+                    "GET {}: Failed to refresh server. {}",
+                    refresh_url, e
+                ));
+                return Vec::new();
+            }
+        }
+    }
+    match client.get(&json_url, &[], false).await {
+        Ok(response) => {
+            if response.status() != 200 {
+                ctx.logger.warn(format!("GET {}: Failed to fetch updates from server. Server returned invalid response code: {}", json_url, response.status()));
+                return Vec::new();
+            }
+            let json = parse_json(&get_response_body(response).await);
+            ctx.logger
+                .debug(format!("JSON response for {}: {}", name, json));
+            if let Some(updates) = json["images"].as_array() {
+                let mut server_updates: Vec<Update> = updates
+                    .iter()
+                    .filter_map(|img| serde_json::from_value(img.clone()).ok())
+                    .collect();
+                // Add server origin to each image
+                for update in &mut server_updates {
+                    update.server = Some(name.to_string());
+                    update.status = update.get_status();
+                }
+                ctx.logger
+                    .debug(format!("Updates for {}: {:#?}", name, server_updates));
+                return server_updates;
+            }
+
+            Vec::new()
+        }
+        Err(e) => {
+            ctx.logger.warn(format!(
+                "GET {}: Failed to fetch updates from server. {}",
+                json_url, e
+            ));
+            Vec::new()
+        }
+    }
+}
+
 /// Fetches image data from other Cup instances
 async fn get_remote_updates(ctx: &Context, client: &Client, refresh: bool) -> Vec<Update> {
+    get_remote_updates_bounded(ctx, client, refresh, REMOTE_SERVER_TIMEOUT).await
+}
+
+/// The body of [`get_remote_updates`], with the per-server timeout injected so tests don't
+/// have to wait out the production value.
+async fn get_remote_updates_bounded(
+    ctx: &Context,
+    client: &Client,
+    refresh: bool,
+    per_server_timeout: Duration,
+) -> Vec<Update> {
     let mut remote_images = Vec::new();
 
-    let handles: Vec<_> = ctx.config.servers
+    let handles: Vec<_> = ctx
+        .config
+        .servers
         .iter()
         .map(|(name, url)| async move {
-            let base_url = if url.starts_with("http://") || url.starts_with("https://") {
-                format!("{}/api/v3/", url.trim_end_matches('/'))
-            } else {
-                format!("https://{}/api/v3/", url.trim_end_matches('/'))
-            };
-            let json_url = base_url.clone() + "json";
-            if refresh {
-                let refresh_url = base_url + "refresh";
-                match client.get(&refresh_url, &[], false).await {
-                    Ok(response) => {
-                        if response.status() != 200 {
-                            ctx.logger.warn(format!("GET {}: Failed to refresh server. Server returned invalid response code: {}", refresh_url, response.status()));
-                            return Vec::new();
-                        }
-                    },
-                    Err(e) => {
-                        ctx.logger.warn(format!("GET {}: Failed to refresh server. {}", refresh_url, e));
-                        return Vec::new();
-                    },
-                }
-
-            }
-            match client.get(&json_url, &[], false).await {
-                Ok(response) => {
-                    if response.status() != 200 {
-                        ctx.logger.warn(format!("GET {}: Failed to fetch updates from server. Server returned invalid response code: {}", json_url, response.status()));
-                        return Vec::new();
-                    }
-                    let json = parse_json(&get_response_body(response).await);
-                    ctx.logger.debug(format!("JSON response for {}: {}", name, json));
-                    if let Some(updates) = json["images"].as_array() {
-                        let mut server_updates: Vec<Update> = updates
-                            .iter()
-                            .filter_map(|img| serde_json::from_value(img.clone()).ok())
-                            .collect();
-                        // Add server origin to each image
-                        for update in &mut server_updates {
-                            update.server = Some(name.clone());
-                            update.status = update.get_status();
-                        }
-                        ctx.logger.debug(format!("Updates for {}: {:#?}", name, server_updates));
-                        return server_updates;
-                    }
-
+            match tokio::time::timeout(
+                per_server_timeout,
+                get_server_updates(ctx, client, name, url, refresh),
+            )
+            .await
+            {
+                Ok(updates) => updates,
+                Err(_) => {
+                    ctx.logger.warn(format!(
+                        "Timed out after {}s waiting for server {} ({}). Skipping it.",
+                        per_server_timeout.as_secs(),
+                        name,
+                        url
+                    ));
                     Vec::new()
                 }
-                Err(e) => {
-                    ctx.logger.warn(format!("GET {}: Failed to fetch updates from server. {}", json_url, e));
-                    Vec::new()
-                },
             }
         })
         .collect();
@@ -179,37 +236,47 @@ pub async fn get_updates(
             .push(image);
     }
 
-    // Retrieve an authentication token (if required) for each registry.
-    let mut tokens: FxHashMap<&str, Option<String>> = FxHashMap::default();
-    // Registries whose token could not be fetched (e.g. the token endpoint returned
+    // Retrieve authentication tokens (if required) for each registry.
+    //
+    // Keyed by (registry, repository) rather than by registry: a registry's repositories
+    // are split across several tokens so no single token can grow past the header size a
+    // registry will accept. See `MAX_REPOSITORIES_PER_TOKEN`.
+    let mut tokens: FxHashMap<(&str, &str), Option<String>> = FxHashMap::default();
+    // Repositories whose token could not be fetched (e.g. the token endpoint returned
     // 403/429). Their images are surfaced as errored rather than crashing the run.
-    let mut token_errors: FxHashMap<&str, String> = FxHashMap::default();
+    let mut token_errors: FxHashMap<(&str, &str), String> = FxHashMap::default();
     for registry in registries.clone() {
         let credentials = if let Some(registry_config) = ctx.config.registries.get(registry) {
             &registry_config.authentication
         } else {
             &None
         };
+        let registry_images = image_map.get(registry).unwrap();
         match check_auth(registry, ctx, &client).await {
             Some(auth_url) => {
-                match get_token(
-                    image_map.get(registry).unwrap(),
-                    &auth_url,
-                    credentials,
-                    &client,
-                )
-                .await
-                {
-                    Ok(token) => {
-                        tokens.insert(registry, Some(token));
-                    }
-                    Err(error) => {
-                        token_errors.insert(registry, error);
+                for batch in batch_repositories(registry_images) {
+                    match get_token(&batch, &auth_url, credentials, &client).await {
+                        Ok(token) => {
+                            for repository in batch {
+                                tokens.insert((registry, repository), Some(token.clone()));
+                            }
+                        }
+                        Err(error) => {
+                            for repository in batch {
+                                token_errors.insert((registry, repository), error.clone());
+                            }
+                        }
                     }
                 }
             }
             None => {
-                tokens.insert(registry, None);
+                for repository in registry_images
+                    .iter()
+                    .map(|image| image.parts.repository.as_str())
+                    .unique()
+                {
+                    tokens.insert((registry, repository), None);
+                }
             }
         }
     }
@@ -231,7 +298,11 @@ pub async fn get_updates(
                 .iter()
                 .any(|item| image.reference.starts_with(item));
         if !is_ignored {
-            if let Some(error) = token_errors.get(image.parts.registry.as_str()) {
+            let key = (
+                image.parts.registry.as_str(),
+                image.parts.repository.as_str(),
+            );
+            if let Some(error) = token_errors.get(&key) {
                 errored_images.push(Image {
                     error: Some(error.clone()),
                     ..image.clone()
@@ -239,8 +310,11 @@ pub async fn get_updates(
                 continue;
             }
             let excluded_tags = get_excluded_tags(image, ctx);
-            let token = tokens.get(image.parts.registry.as_str()).unwrap();
-            let future = image.check(token.as_deref(), ctx, &client, excluded_tags);
+            let token = match tokens.get(&key) {
+                Some(token) => token.as_deref(),
+                None => None,
+            };
+            let future = image.check(token, ctx, &client, excluded_tags);
             handles.push(future);
         }
     }
@@ -248,6 +322,68 @@ pub async fn get_updates(
     let mut images = join_all(handles).await;
     images.extend(errored_images);
     let mut updates: Vec<Update> = images.iter().map(|image| image.to_update()).collect();
+
+    // Attach compose-project info (folder, service, project) to each local update, so the
+    // API/UI can map an available update back to the folder that can apply it.
+    let compose_map = get_compose_containers(ctx).await;
+    for update in &mut updates {
+        if let Some(containers) = compose_map.get(&update.reference) {
+            update.compose_managed = !containers.is_empty();
+            update.compose = containers.clone();
+        }
+    }
+
     updates.extend_from_slice(&remote_updates);
     updates
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::logging::Logger;
+    use std::time::Instant;
+
+    /// Regression test for the startup hang: a remote server that completes the TCP
+    /// handshake and then never sends a byte used to block `get_remote_updates` forever,
+    /// because the HTTP client had no timeout. `serve()` runs this check *before* binding
+    /// its port, so one such peer kept Cup from ever starting.
+    #[tokio::test]
+    async fn unresponsive_remote_server_is_skipped_not_awaited_forever() {
+        // A listener that accepts connections and then holds them open in silence.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut accepted = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                accepted.push(stream);
+            }
+        });
+
+        let mut config = Config::new();
+        config
+            .servers
+            .insert("stalled".to_string(), format!("http://{}", addr));
+        let ctx = Context {
+            config,
+            logger: Logger::new(false, false),
+        };
+        let client = Client::new(&ctx);
+
+        let per_server_timeout = Duration::from_secs(1);
+        let start = Instant::now();
+        let updates = get_remote_updates_bounded(&ctx, &client, true, per_server_timeout).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            updates.is_empty(),
+            "a silent server should contribute no updates"
+        );
+        assert!(
+            elapsed < per_server_timeout * 5,
+            "expected the stalled server to be abandoned near {:?}, but waited {:?}",
+            per_server_timeout,
+            elapsed
+        );
+    }
 }

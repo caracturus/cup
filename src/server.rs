@@ -12,17 +12,20 @@ use xitca_web::{
     bytes::Bytes,
     error::Error,
     handler::{handler_service, path::PathRef, state::StateRef},
-    http::{StatusCode, WebResponse},
-    route::get,
+    http::{StatusCode, WebRequest, WebResponse},
+    route::{get, post},
     service::Service,
     App, WebContext,
 };
+
+use serde::{Deserialize, Serialize};
+use tokio::process::Command;
 
 use crate::{
     check::get_updates,
     config::Theme,
     error,
-    structs::update::Update,
+    structs::update::{Update, UpdateInfo},
     utils::{
         json::{to_full_json, to_simple_json},
         sort_update_vec::sort_update_vec,
@@ -90,7 +93,8 @@ pub async fn serve(port: &u16, ctx: &Context) -> std::io::Result<()> {
         .at("/api/v2/json", get(handler_service(api_simple)))
         .at("/api/v3/json", get(handler_service(api_full)))
         .at("/api/v2/refresh", get(handler_service(refresh)))
-        .at("/api/v3/refresh", get(handler_service(refresh)));
+        .at("/api/v3/refresh", get(handler_service(refresh)))
+        .at("/actions/update", post(handler_service(apply_updates)));
     if !ctx.config.agent {
         app_builder = app_builder
             .at("/", get(handler_service(_static)))
@@ -175,6 +179,273 @@ async fn api_full(data: StateRef<'_, Arc<Mutex<ServerData>>>) -> WebResponse {
 async fn refresh(data: StateRef<'_, Arc<Mutex<ServerData>>>) -> WebResponse {
     data.lock().await.refresh().await;
     WebResponse::new(ResponseBody::from("OK"))
+}
+
+#[derive(Deserialize)]
+struct UpdateRequest {
+    /// Image references the user selected in the UI.
+    references: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct UpdateResultItem {
+    reference: String,
+    project: String,
+    working_dir: String,
+    success: bool,
+    message: String,
+}
+
+/// A validated compose target to update, resolved server-side from scan data.
+struct UpdateTarget {
+    reference: String,
+    project: String,
+    working_dir: String,
+    config_files: String,
+    is_self: bool,
+}
+
+/// CSRF protection for the privileged `/actions/update` route.
+///
+/// Returns `Some(response)` (403) when the request doesn't look like it originated from
+/// the Cup UI on this same origin, so the caller can short-circuit before doing work;
+/// `None` means the request may proceed.
+///
+/// Two layers:
+///  1. Require `Content-Type: application/json`. A cross-site HTML `<form>` can't set
+///     that Content-Type, and a cross-origin `fetch` that does triggers a CORS
+///     preflight (`OPTIONS`) which this server rejects (405) — so this alone blocks the
+///     common CSRF vectors. The Cup UI already sends this header.
+///  2. When the browser supplies an `Origin` (or `Referer`) header, require its host to
+///     match the `Host` the request was addressed to (same-origin). Requests with
+///     neither header (e.g. curl, server-to-server) are allowed through — those aren't
+///     browser-driven CSRF.
+fn reject_if_cross_origin(req: &WebRequest<()>) -> Option<WebResponse> {
+    let headers = req.headers();
+    let forbid = |msg: &str| {
+        Some(
+            WebResponse::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(ResponseBody::from(msg.to_string()))
+                .unwrap(),
+        )
+    };
+
+    // 1. Content-Type must be application/json (ignoring any `; charset=...` params).
+    let media_type = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim();
+    if !media_type.eq_ignore_ascii_case("application/json") {
+        return forbid("Content-Type must be application/json");
+    }
+
+    // 2. If present, the Origin/Referer host must match the Host header.
+    let source_host = headers
+        .get("origin")
+        .or_else(|| headers.get("referer"))
+        .and_then(|v| v.to_str().ok())
+        .and_then(authority_of);
+    if let Some(source_host) = source_host {
+        let host = headers.get("host").and_then(|v| v.to_str().ok());
+        if host.map(|h| h.eq_ignore_ascii_case(&source_host)) != Some(true) {
+            return forbid("Cross-origin request rejected");
+        }
+    }
+
+    None
+}
+
+/// Extracts the `host[:port]` authority from a URL such as `http://host:8000/path`.
+fn authority_of(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    (!authority.is_empty()).then(|| authority.to_string())
+}
+
+/// POST /actions/update — applies floating-tag (digest) updates by running
+/// `docker compose pull && docker compose up -d` in each selected project's folder.
+///
+/// Security: the client sends only image references. The server resolves the actual
+/// folders from scan data it collected itself (never from client input), validates that
+/// each reference currently has a digest update and is compose-managed, and runs commands
+/// via an argument array (no shell). In production this route MUST sit behind authentication
+/// (it is intentionally not under /api/, which is commonly left unauthenticated).
+async fn apply_updates(
+    http_req: &WebRequest<()>,
+    data: StateRef<'_, Arc<Mutex<ServerData>>>,
+    body: String,
+) -> WebResponse {
+    // CSRF protection: this route runs privileged, state-changing commands
+    // (docker compose pull && up -d). Reject anything that isn't a same-origin JSON
+    // request from the Cup UI *before* parsing the body, locking, or running anything.
+    if let Some(response) = reject_if_cross_origin(http_req) {
+        return response;
+    }
+
+    let req: UpdateRequest = match serde_json::from_str(&body) {
+        Ok(req) => req,
+        Err(e) => {
+            return WebResponse::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(ResponseBody::from(format!("Invalid request body: {}", e)))
+                .unwrap();
+        }
+    };
+
+    // Best-effort own-container id (Docker sets HOSTNAME to the container id) so we can
+    // refuse to update Cup itself, which would kill the process mid-request.
+    let own_id = std::env::var("HOSTNAME").unwrap_or_default();
+    let logger = data.lock().await.ctx.logger.clone();
+
+    // Resolve + validate targets under a short lock, then release it before running commands.
+    let targets: Vec<UpdateTarget> = {
+        let guard = data.lock().await;
+        let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+        let mut targets = Vec::new();
+        for reference in &req.references {
+            let Some(update) = guard.raw_updates.iter().find(|u| &u.reference == reference) else {
+                continue;
+            };
+            // Never act on an update that belongs to another server: this central Cup can
+            // only run `docker compose` on its own host, so it can't recreate containers
+            // living on a remote VM. (Remote updates also carry no compose info anyway.)
+            if update.server.is_some() {
+                continue;
+            }
+            // Only digest (floating-tag) updates can be applied with pull && up -d.
+            let is_digest = matches!(update.result.info, UpdateInfo::Digest(_));
+            if update.result.has_update != Some(true) || !is_digest {
+                continue;
+            }
+            for container in &update.compose {
+                if container.working_dir.is_empty() {
+                    continue;
+                }
+                if !seen.insert((container.project.clone(), container.working_dir.clone())) {
+                    continue;
+                }
+                let is_self = !own_id.is_empty() && container.id.starts_with(&own_id);
+                targets.push(UpdateTarget {
+                    reference: reference.clone(),
+                    project: container.project.clone(),
+                    working_dir: container.working_dir.clone(),
+                    config_files: container.config_files.clone(),
+                    is_self,
+                });
+            }
+        }
+        targets
+    };
+
+    logger.info(format!(
+        "apply-updates: recreating {} compose project(s): [{}]",
+        targets.len(),
+        targets
+            .iter()
+            .map(|t| t.project.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+
+    let mut results: Vec<UpdateResultItem> = Vec::with_capacity(targets.len());
+    for target in targets {
+        let (success, message) = if target.is_self {
+            (false, "Refusing to update Cup's own container".to_string())
+        } else {
+            match run_compose_update(&target.working_dir, &target.config_files, &target.project).await
+            {
+                Ok(msg) => (true, msg),
+                Err(e) => (false, e),
+            }
+        };
+        if success {
+            logger.info(format!(
+                "apply-updates: updated '{}' ({})",
+                target.project, target.reference
+            ));
+        } else {
+            logger.warn(format!(
+                "apply-updates: FAILED '{}' ({}): {}",
+                target.project, target.reference, message
+            ));
+        }
+        results.push(UpdateResultItem {
+            reference: target.reference,
+            project: target.project,
+            working_dir: target.working_dir,
+            success,
+            message,
+        });
+    }
+
+    // Re-check so subsequent reads reflect the new state.
+    data.lock().await.refresh().await;
+
+    WebResponse::builder()
+        .header("Content-Type", "application/json")
+        .body(ResponseBody::from(
+            serde_json::json!({ "results": results }).to_string(),
+        ))
+        .unwrap()
+}
+
+/// Runs `docker compose pull` then `docker compose up -d` for one project.
+/// All arguments are passed as an array (no shell), so nothing can be injected.
+async fn run_compose_update(
+    working_dir: &str,
+    config_files: &str,
+    project: &str,
+) -> Result<String, String> {
+    let files: Vec<&str> = config_files
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let build = |args: &[&str]| {
+        let mut cmd = Command::new("docker");
+        cmd.arg("compose").args(["-p", project]);
+        for file in &files {
+            cmd.args(["-f", file]);
+        }
+        cmd.args(args).current_dir(working_dir);
+        cmd
+    };
+
+    let pull = build(&["pull"])
+        .output()
+        .await
+        .map_err(|e| format!("failed to run docker compose pull: {}", e))?;
+    if !pull.status.success() {
+        return Err(format!(
+            "pull failed: {}",
+            String::from_utf8_lossy(&pull.stderr).trim()
+        ));
+    }
+
+    let up = build(&["up", "-d"])
+        .output()
+        .await
+        .map_err(|e| format!("failed to run docker compose up -d: {}", e))?;
+    if !up.status.success() {
+        return Err(format!(
+            "up -d failed: {}",
+            String::from_utf8_lossy(&up.stderr).trim()
+        ));
+    }
+
+    let detail = String::from_utf8_lossy(&up.stderr);
+    let detail = detail.trim();
+    Ok(if detail.is_empty() {
+        "updated".to_string()
+    } else {
+        format!("updated — {}", detail)
+    })
 }
 
 struct ServerData {
@@ -278,8 +549,8 @@ where
     let method = request.method().to_string();
     let url = request.uri().to_string();
 
-    if &method != "GET" {
-        // We only allow GET requests
+    if &method != "GET" && &method != "POST" {
+        // We only allow GET and POST requests
 
         log(&method, &url, 405, elapsed(start));
         Err(Error::from(StatusCode::METHOD_NOT_ALLOWED))
@@ -304,4 +575,37 @@ fn log(method: &str, url: &str, status: u16, time: u32) {
         "\x1b[94;1m HTTP \x1b[0m\x1b[32m{}\x1b[0m {} {}{}\x1b[0m in {}ms",
         method, url, color, status, time
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::authority_of;
+
+    #[test]
+    fn authority_of_extracts_host_and_port() {
+        // Origin-style values (scheme + authority, no path).
+        assert_eq!(
+            authority_of("http://example.com:8000"),
+            Some("example.com:8000".to_string())
+        );
+        assert_eq!(
+            authority_of("https://example.com"),
+            Some("example.com".to_string())
+        );
+        assert_eq!(
+            authority_of("http://10.0.0.5:8000"),
+            Some("10.0.0.5:8000".to_string())
+        );
+        // Referer-style values carry a path/query/fragment we must strip.
+        assert_eq!(
+            authority_of("http://host:8000/a/b?x=1#frag"),
+            Some("host:8000".to_string())
+        );
+        // `Origin: null` (sandboxed/file origins) parses to a host that will never
+        // match a real Host header, so it is correctly rejected downstream.
+        assert_eq!(authority_of("null"), Some("null".to_string()));
+        // Degenerate inputs yield no authority.
+        assert_eq!(authority_of(""), None);
+        assert_eq!(authority_of("http://"), None);
+    }
 }

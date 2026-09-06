@@ -1,0 +1,29 @@
+# Fast dev image: debug build + cached cargo deps. NOT for production.
+# Production uses the original ./Dockerfile (optimized release, FROM scratch).
+
+### Build UI ###
+FROM oven/bun:1-alpine AS web
+WORKDIR /web
+COPY ./web/package.json ./web/bun.lock ./
+RUN bun install
+COPY ./web .
+RUN bun run build
+
+### Build Cup (debug, with cargo caches so rebuilds are fast) ###
+FROM rust:1-alpine AS build
+RUN apk add --no-cache musl-dev
+WORKDIR /cup
+COPY Cargo.toml Cargo.lock ./
+COPY ./src ./src
+COPY --from=web /web/dist src/static
+RUN --mount=type=cache,target=/cup/target \
+    --mount=type=cache,target=/usr/local/cargo/registry \
+    cargo build && cp target/debug/cup /cup/cup-bin
+
+### Main (alpine so we have a shell for debugging during dev) ###
+FROM alpine:3.20
+# docker CLI + compose plugin so Cup can run `docker compose` (Option B)
+RUN apk add --no-cache docker-cli docker-cli-compose
+COPY --from=build /cup/cup-bin /cup
+EXPOSE 8000
+ENTRYPOINT ["/cup"]

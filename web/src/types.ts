@@ -29,6 +29,7 @@ export interface Image {
   time: number;
   server: string | null;
   in_use: boolean | null;
+  compose_managed: boolean;
 }
 
 interface VersionInfo {

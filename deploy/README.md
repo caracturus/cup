@@ -33,8 +33,22 @@ be `scratch` anymore, because applying updates shells out to `docker compose`.)
 
 ## Deploy
 
-Use [`docker-compose.example.yml`](./docker-compose.example.yml) as a starting point.
-Two changes versus a stock Cup deployment:
+Copy [`docker-compose.example.yml`](./docker-compose.example.yml) to
+`docker-compose.yaml` in the deploy checkout and edit it there. **That copy is not
+tracked by this repo** — the root `/docker-compose.yaml` is in `.gitignore`, precisely
+so your live deployment config and git stay out of each other's way:
+
+- `git pull` can't refuse because the live file has local edits, and can't overwrite
+  those edits either;
+- `git reset --hard` and branch switches leave it alone (untracked files survive both),
+  so the checkout can move between `feat/apply-updates` and any other branch safely;
+- host-specific paths, hostnames and auth labels never get pushed to the fork.
+
+The flip side: your live compose file now exists **only on the host**, like
+`~/docker/cup/cup.json`. Back both up somewhere outside the checkout — a `git clean -fdx`
+in that directory would delete them.
+
+Three changes versus a stock Cup deployment:
 
 1. **Mount your compose-projects directory at the same absolute path** it has on the
    host: `-v /home/caradoc/docker-compose:/home/caradoc/docker-compose`. This is where
@@ -45,6 +59,10 @@ Two changes versus a stock Cup deployment:
    out reduces what Cup can touch.
 2. **Exclude it from Watchtower** (`com.centurylinklabs.watchtower.enable=false`) so
    your custom image isn't replaced by upstream's `:latest`.
+3. **Keep the `build:` section.** The image tag is local — it exists in no registry — so
+   `docker compose pull` fetches nothing and a plain `up -d` restarts the *stale* image.
+   With `build:` present, `docker compose up -d --build` after a `git pull` is all it
+   takes to get the new binary running.
 
 ## Security checklist (read before exposing)
 
@@ -100,9 +118,19 @@ Then rebuild + redeploy on the host:
 
 ```bash
 git fetch origin && git reset --hard origin/feat/apply-updates   # sync this clone
-docker build -t cup-apply-updates:latest .
-docker compose up -d
+docker compose up -d --build                                     # rebuild + recreate
 ```
+
+`--build` is not optional: without it compose reuses the existing
+`cup-apply-updates:latest` and the container comes back on the old binary. Confirm the
+image is newer than the commit you just checked out with:
+
+```bash
+docker image inspect --format '{{.Created}}' cup-apply-updates:latest
+```
+
+The `reset --hard` above is safe for your `docker-compose.yaml`: it is untracked, and
+`reset --hard` does not touch untracked files.
 
 Rebase onto the release **tag** (`v3.6.x`), not `upstream/main` — tags are stable
 releases; `main` may contain unreleased work.

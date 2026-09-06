@@ -1,11 +1,19 @@
 # Example production deployment for the "apply updates" Cup fork.
-# Adapt paths/hostnames to your environment, then `docker compose up -d`.
+#
+# Copy this to `docker-compose.yaml` in your deploy checkout and adapt the paths and
+# hostnames, then `docker compose up -d --build`. Your copy is deliberately NOT tracked
+# by this repo (see .gitignore) — it is host-specific config, and keeping it untracked is
+# what stops `git pull` and branch switches from fighting with your live deployment.
 services:
   cup:
     # The apply-updates feature is NOT in upstream Cup, so you must run YOUR image.
-    # Build it on this host:   docker build -t cup-apply-updates:latest .
-    # (or push to your own registry and reference it here).
     image: cup-apply-updates:latest
+    # Built from this checkout, not pulled. Without `build` here, `docker compose up -d`
+    # silently keeps running the previous binary (the image tag is local, so there is
+    # nothing to pull); use `up -d --build` after a `git pull`.
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: cup
     restart: unless-stopped
     command: -c /config/cup.json serve
